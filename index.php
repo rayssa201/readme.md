@@ -1,0 +1,515 @@
+<?php
+declare(strict_types=1);
+session_start();
+
+/*
+ * PETVIDA - Sistema de Gestão Veterinária
+ * PHP 8+, PDO SQLite, cURL e Bootstrap 5
+ * Salve como index.php em uma pasta com permissões de escrita.
+ */
+
+$dbFile = __DIR__ . '/petvida.db';
+
+try {
+    $pdo = new PDO('sqlite:' . $dbFile);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+    $pdo->exec('PRAGMA foreign_keys = ON');
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            senha TEXT NOT NULL,
+            cargo TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tutores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_completo TEXT NOT NULL,
+            cpf TEXT UNIQUE NOT NULL,
+            telefone TEXT NOT NULL,
+            email TEXT,
+            cep TEXT,
+            endereco TEXT,
+            bairro TEXT,
+            cidade TEXT,
+            estado TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS animais (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            especie TEXT NOT NULL,
+            raca TEXT,
+            sexo TEXT,
+            data_nascimento TEXT,
+            cor TEXT,
+            peso REAL,
+            microchip TEXT,
+            observacoes TEXT,
+            tutor_id INTEGER NOT NULL,
+            FOREIGN KEY (tutor_id) REFERENCES tutores(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS estoque (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            produto TEXT NOT NULL,
+            categoria TEXT,
+            quantidade INTEGER NOT NULL DEFAULT 0,
+            data_validade TEXT,
+            fornecedor TEXT
+        );
+    ");
+
+    if ((int)$pdo->query('SELECT COUNT(*) FROM usuarios')->fetchColumn() === 0) {
+        $stmt = $pdo->prepare('INSERT INTO usuarios (nome,email,senha,cargo) VALUES (?,?,?,?)');
+        $stmt->execute([
+            'Administrador Master',
+            'admin@petvida.com',
+            password_hash('admin123', PASSWORD_DEFAULT),
+            'Administrador'
+        ]);
+    }
+} catch (Throwable $e) {
+    http_response_code(500);
+    exit('Não foi possível iniciar o banco de dados. Verifique se a pasta permite gravação. Detalhe: ' .
+        htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8'));
+}
+
+function e($value): string {
+    return htmlspecialchars((string)($value ?? ''), ENT_QUOTES, 'UTF-8');
+}
+function redirect(string $url): never {
+    header('Location: ' . $url);
+    exit;
+}
+function csrf_token(): string {
+    if (empty($_SESSION['csrf'])) {
+        $_SESSION['csrf'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf'];
+}
+function check_csrf(): void {
+    $token = $_POST['csrf'] ?? '';
+    if (!is_string($token) || !hash_equals($_SESSION['csrf'] ?? '', $token)) {
+        http_response_code(403);
+        exit('Solicitação inválida. Atualize a página e tente novamente.');
+    }
+}
+function flash(string $type, string $message): void {
+    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
+}
+function get_flash(): ?array {
+    $msg = $_SESSION['flash'] ?? null;
+    unset($_SESSION['flash']);
+    return $msg;
+}
+
+$action = $_GET['acao'] ?? 'dashboard';
+
+/* API de consulta de CEP */
+if (isset($_GET['ajax_cep'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    $cep = preg_replace('/\D/', '', (string)$_GET['ajax_cep']);
+    if (strlen($cep) !== 8) {
+        http_response_code(400);
+        echo json_encode(['erro' => true, 'mensagem' => 'CEP deve conter 8 números.']);
+        exit;
+    }
+    if (!function_exists('curl_init')) {
+        http_response_code(503);
+        echo json_encode(['erro' => true, 'mensagem' => 'A extensão cURL não está habilitada no PHP.']);
+        exit;
+    }
+    $ch = curl_init("https://viacep.com.br/ws/{$cep}/json/");
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_USERAGENT => 'PetVida/1.0'
+    ]);
+    $response = curl_exec($ch);
+    $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($response === false || $status !== 200) {
+        http_response_code(502);
+        echo json_encode(['erro' => true, 'mensagem' => 'Serviço de CEP indisponível.']);
+        exit;
+    }
+    echo $response;
+    exit;
+}
+
+/* Acesso direto: o sistema abre sem tela de e-mail e senha. */
+if ($action === 'logout' || $action === 'login') {
+    $action = 'dashboard';
+}
+
+/* Ações de cadastro */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['login'])) {
+    check_csrf();
+
+    try {
+        if (isset($_POST['cadastrar_tutor'])) {
+            $stmt = $pdo->prepare('INSERT INTO tutores
+                (nome_completo,cpf,telefone,email,cep,endereco,bairro,cidade,estado)
+                VALUES (?,?,?,?,?,?,?,?,?)');
+            $stmt->execute([
+                trim($_POST['nome_completo'] ?? ''),
+                trim($_POST['cpf'] ?? ''),
+                trim($_POST['telefone'] ?? ''),
+                trim($_POST['email'] ?? ''),
+                trim($_POST['cep'] ?? ''),
+                trim($_POST['endereco'] ?? ''),
+                trim($_POST['bairro'] ?? ''),
+                trim($_POST['cidade'] ?? ''),
+                trim($_POST['estado'] ?? '')
+            ]);
+            flash('success', 'Tutor cadastrado com sucesso!');
+            redirect('?acao=tutores');
+        }
+
+        if (isset($_POST['cadastrar_animal'])) {
+            $tutorId = (int)($_POST['tutor_id'] ?? 0);
+            $stmt = $pdo->prepare('INSERT INTO animais
+                (nome,especie,raca,sexo,data_nascimento,cor,peso,microchip,observacoes,tutor_id)
+                VALUES (?,?,?,?,?,?,?,?,?,?)');
+            $stmt->execute([
+                trim($_POST['nome'] ?? ''),
+                trim($_POST['especie'] ?? ''),
+                trim($_POST['raca'] ?? ''),
+                trim($_POST['sexo'] ?? ''),
+                trim($_POST['data_nascimento'] ?? ''),
+                trim($_POST['cor'] ?? ''),
+                ($_POST['peso'] ?? '') !== '' ? (float)$_POST['peso'] : null,
+                trim($_POST['microchip'] ?? ''),
+                trim($_POST['observacoes'] ?? ''),
+                $tutorId
+            ]);
+            flash('success', 'Animal cadastrado com sucesso!');
+            redirect('?acao=animais');
+        }
+
+        if (isset($_POST['cadastrar_estoque'])) {
+            $stmt = $pdo->prepare('INSERT INTO estoque (produto,categoria,quantidade,data_validade,fornecedor)
+                VALUES (?,?,?,?,?)');
+            $stmt->execute([
+                trim($_POST['produto'] ?? ''),
+                trim($_POST['categoria'] ?? ''),
+                max(0, (int)($_POST['quantidade'] ?? 0)),
+                trim($_POST['data_validade'] ?? ''),
+                trim($_POST['fornecedor'] ?? '')
+            ]);
+            flash('success', 'Produto adicionado ao estoque!');
+            redirect('?acao=estoque');
+        }
+    } catch (PDOException $ex) {
+        $message = str_contains(strtolower($ex->getMessage()), 'unique')
+            ? 'Já existe um cadastro com esse CPF.'
+            : 'Não foi possível salvar. Confira os campos e tente novamente.';
+        flash('danger', $message);
+        $back = isset($_POST['cadastrar_tutor']) ? 'novo_tutor' :
+            (isset($_POST['cadastrar_animal']) ? 'novo_animal' : 'novo_estoque');
+        redirect('?acao=' . $back);
+    }
+}
+
+/* Dados usados nas páginas */
+$flash = get_flash();
+$totTutores = (int)$pdo->query('SELECT COUNT(*) FROM tutores')->fetchColumn();
+$totAnimais = (int)$pdo->query('SELECT COUNT(*) FROM animais')->fetchColumn();
+$totEstoque = (int)$pdo->query('SELECT COUNT(*) FROM estoque')->fetchColumn();
+$estoqueBaixo = (int)$pdo->query('SELECT COUNT(*) FROM estoque WHERE quantidade <= 5')->fetchColumn();
+$tutores = $pdo->query('SELECT * FROM tutores ORDER BY id DESC')->fetchAll();
+$animais = $pdo->query('SELECT animais.*, tutores.nome_completo AS tutor_nome
+    FROM animais LEFT JOIN tutores ON tutores.id = animais.tutor_id ORDER BY animais.id DESC')->fetchAll();
+$produtos = $pdo->query('SELECT * FROM estoque ORDER BY id DESC')->fetchAll();
+
+/* Clima: coordenadas aproximadas de Itaperuçu-PR */
+$clima = null;
+if ($action === 'dashboard' && function_exists('curl_init')) {
+    $ch = curl_init('https://api.open-meteo.com/v1/forecast?latitude=-25.22&longitude=-49.35&current=temperature_2m,relative_humidity_2m,weather_code&timezone=America%2FSao_Paulo');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_USERAGENT => 'PetVida/1.0'
+    ]);
+    $weatherResponse = curl_exec($ch);
+    curl_close($ch);
+    if ($weatherResponse) {
+        $weatherData = json_decode($weatherResponse, true);
+        $clima = $weatherData['current'] ?? null;
+    }
+}
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PetVida | Gestão Veterinária</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
+<style>
+:root{--navy:#173b67;--blue:#2878c8;--sky:#eaf4ff;--ink:#26364a;--muted:#718096}
+body{background:#f4f7fb;color:var(--ink);font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif}
+.sidebar{width:250px;min-height:100vh;background:linear-gradient(180deg,#173b67,#102d50);position:fixed;inset:0 auto 0 0;padding:25px 16px;color:white;z-index:100}
+.brand{font-size:1.45rem;font-weight:800;letter-spacing:.2px;padding:0 12px 28px}
+.brand span{color:#83c7ff}
+.side-label{font-size:.68rem;text-transform:uppercase;letter-spacing:1.5px;color:#9bb3ce;padding:12px 13px 8px}
+.side-link{display:flex;align-items:center;gap:12px;padding:11px 13px;margin:3px 0;border-radius:10px;color:#d9e7f6;text-decoration:none;font-weight:500;transition:.2s}
+.side-link:hover,.side-link.active{background:rgba(255,255,255,.14);color:white}
+.side-link i{font-size:1.1rem;width:22px}
+.main{margin-left:250px;padding:28px 34px;min-height:100vh}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}
+.eyebrow{font-size:.78rem;color:var(--muted);text-transform:uppercase;letter-spacing:1.2px;font-weight:700}
+.page-title{font-size:1.8rem;font-weight:800;margin:3px 0 0;color:#1b3554}
+.user-chip{background:white;border:1px solid #e6edf5;border-radius:30px;padding:8px 14px;display:flex;align-items:center;gap:10px}
+.avatar{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:var(--sky);color:var(--blue);font-weight:800}
+.stat-card,.panel{background:white;border:1px solid #e8eef5;border-radius:16px;box-shadow:0 5px 18px rgba(31,59,91,.045)}
+.stat-card{padding:22px;display:flex;align-items:center;justify-content:space-between;height:100%}
+.stat-label{color:var(--muted);font-size:.88rem;font-weight:600}
+.stat-number{font-size:2rem;font-weight:800;color:#1b3554;margin-top:5px}
+.stat-icon{width:54px;height:54px;border-radius:15px;display:grid;place-items:center;font-size:1.5rem}
+.icon-blue{background:#eaf4ff;color:#2878c8}.icon-green{background:#e8f8ef;color:#22985a}.icon-orange{background:#fff3e4;color:#d88722}.icon-purple{background:#f1edff;color:#7958c8}
+.panel{padding:23px}
+.panel-title{font-weight:750;color:#1b3554;margin-bottom:4px}
+.panel-subtitle{font-size:.85rem;color:var(--muted)}
+.table{vertical-align:middle;margin:0}
+.table thead th{font-size:.75rem;text-transform:uppercase;letter-spacing:.6px;color:#74849a;border-bottom:1px solid #e8eef5;padding:13px 12px}
+.table tbody td{padding:14px 12px;border-color:#edf1f6;font-size:.9rem}
+.form-control,.form-select{border-color:#dce5ef;border-radius:9px;padding:10px 12px}
+.form-control:focus,.form-select:focus{border-color:#72b5f1;box-shadow:0 0 0 .2rem rgba(40,120,200,.12)}
+.form-label{font-size:.88rem;font-weight:650;color:#40536b}
+.btn{border-radius:9px;font-weight:600;padding:9px 15px}
+.btn-primary{background:#2878c8;border-color:#2878c8}
+.btn-primary:hover{background:#1d65ad;border-color:#1d65ad}
+.badge-soft{background:#eaf4ff;color:#2878c8;padding:7px 10px;border-radius:20px}
+.weather{background:linear-gradient(115deg,#1d609f,#398ed2);color:white;border:0}
+.weather .muted-white{color:#dceeff}
+.mobile-brand{display:none}
+@media(max-width:900px){.sidebar{width:215px}.main{margin-left:215px;padding:24px 20px}}
+@media(max-width:700px){.sidebar{position:relative;width:100%;min-height:auto;padding:12px}.brand{padding:4px 10px 12px}.side-label{display:none}.sidebar nav{display:flex;overflow-x:auto;gap:5px}.side-link{white-space:nowrap;padding:9px 11px;font-size:.85rem}.side-link i{width:auto}.main{margin-left:0;padding:20px 14px}.topbar{align-items:flex-start;gap:12px}.page-title{font-size:1.45rem}.user-chip{font-size:.8rem}.user-chip .avatar{width:30px;height:30px}}
+</style>
+</head>
+<body>
+
+
+
+<aside class="sidebar">
+    <div class="brand">🐾 Pet<span>Vida</span></div>
+    <div class="side-label">Menu principal</div>
+    <nav class="d-block">
+        <a class="side-link <?= $action==='dashboard'?'active':'' ?>" href="?acao=dashboard"><i class="bi bi-grid-1x2-fill"></i> Visão geral</a>
+        <a class="side-link <?= in_array($action,['tutores','novo_tutor'])?'active':'' ?>" href="?acao=tutores"><i class="bi bi-people-fill"></i> Tutores</a>
+        <a class="side-link <?= in_array($action,['animais','novo_animal'])?'active':'' ?>" href="?acao=animais"><i class="bi bi-heart-fill"></i> Animais</a>
+        <a class="side-link <?= in_array($action,['estoque','novo_estoque'])?'active':'' ?>" href="?acao=estoque"><i class="bi bi-box-seam-fill"></i> Estoque</a>
+    </nav>
+    <div class="small mt-5 px-3" style="color:#9bb3ce">PetVida © <?= date('Y') ?><br>Cuidado e gestão em um só lugar.</div>
+</aside>
+
+<main class="main">
+    <header class="topbar">
+        <div>
+            <div class="eyebrow">Sistema de gestão veterinária</div>
+            <h1 class="page-title">
+                <?php
+                $titles = ['dashboard'=>'Visão geral','tutores'=>'Tutores','novo_tutor'=>'Novo tutor',
+                    'animais'=>'Animais','novo_animal'=>'Novo animal','estoque'=>'Estoque','novo_estoque'=>'Novo produto'];
+                echo e($titles[$action] ?? 'PetVida');
+                ?>
+            </h1>
+        </div>
+        <div class="user-chip">
+            <div class="avatar">P</div>
+            <div><div class="fw-bold small">Equipe PetVida</div><div class="text-secondary" style="font-size:.72rem">Sistema veterinário</div></div>
+        </div>
+    </header>
+
+    <?php if ($flash): ?><div class="alert alert-<?= e($flash['type']) ?> alert-dismissible fade show" role="alert"><?= e($flash['message']) ?><button type="button" class="btn-close" data-bs-dismiss="alert"></button></div><?php endif; ?>
+
+    <?php if ($action === 'dashboard'): ?>
+        <div class="mb-4">
+            <h2 class="h5 fw-bold mb-1">Bem-vindo à PetVida! 👋</h2>
+            <p class="text-secondary mb-0">Aqui está o resumo da sua clínica.</p>
+        </div>
+        <div class="row g-3 mb-4">
+            <div class="col-6 col-xl-3"><div class="stat-card"><div><div class="stat-label">Tutores</div><div class="stat-number"><?= $totTutores ?></div><a class="small text-decoration-none" href="?acao=tutores">Ver cadastros</a></div><div class="stat-icon icon-blue"><i class="bi bi-people-fill"></i></div></div></div>
+            <div class="col-6 col-xl-3"><div class="stat-card"><div><div class="stat-label">Animais</div><div class="stat-number"><?= $totAnimais ?></div><a class="small text-decoration-none" href="?acao=animais">Ver animais</a></div><div class="stat-icon icon-green"><i class="bi bi-heart-fill"></i></div></div></div>
+            <div class="col-6 col-xl-3"><div class="stat-card"><div><div class="stat-label">Produtos</div><div class="stat-number"><?= $totEstoque ?></div><a class="small text-decoration-none" href="?acao=estoque">Ver estoque</a></div><div class="stat-icon icon-purple"><i class="bi bi-box-seam-fill"></i></div></div></div>
+            <div class="col-6 col-xl-3"><div class="stat-card"><div><div class="stat-label">Estoque baixo</div><div class="stat-number"><?= $estoqueBaixo ?></div><span class="small text-secondary">Até 5 unidades</span></div><div class="stat-icon icon-orange"><i class="bi bi-exclamation-triangle-fill"></i></div></div></div>
+        </div>
+        <div class="row g-3">
+            <div class="col-lg-7">
+                <section class="panel h-100">
+                    <div class="d-flex justify-content-between align-items-center mb-3"><div><h3 class="panel-title">Acesso rápido</h3><div class="panel-subtitle">Atalhos para as principais funções</div></div><i class="bi bi-lightning-charge text-primary fs-4"></i></div>
+                    <div class="row g-3">
+                        <div class="col-sm-6"><a href="?acao=novo_tutor" class="btn btn-primary w-100 py-3"><i class="bi bi-person-plus me-2"></i>Cadastrar tutor</a></div>
+                        <div class="col-sm-6"><a href="?acao=novo_animal" class="btn btn-outline-primary w-100 py-3"><i class="bi bi-plus-circle me-2"></i>Cadastrar animal</a></div>
+                        <div class="col-sm-6"><a href="?acao=novo_estoque" class="btn btn-outline-primary w-100 py-3"><i class="bi bi-box-seam me-2"></i>Adicionar produto</a></div>
+                        <div class="col-sm-6"><a href="?acao=tutores" class="btn btn-outline-secondary w-100 py-3"><i class="bi bi-list-ul me-2"></i>Consultar tutores</a></div>
+                    </div>
+                </section>
+            </div>
+            <div class="col-lg-5">
+                <section class="panel weather h-100">
+                    <div class="d-flex justify-content-between"><div><div class="muted-white small">INFORMAÇÕES DO TEMPO</div><h3 class="h5 fw-bold mt-1">Clima na região</h3></div><i class="bi bi-cloud-sun fs-2"></i></div>
+                    <?php if ($clima && isset($clima['temperature_2m'])): ?>
+                        <div class="display-4 fw-bold mt-3"><?= e($clima['temperature_2m']) ?>°C</div>
+                        <div class="muted-white">Umidade: <?= e($clima['relative_humidity_2m'] ?? '—') ?>%</div>
+                        <?php if ((float)$clima['temperature_2m'] >= 28): ?>
+                            <div class="alert alert-warning mt-3 mb-0 small"><strong>Atenção ao calor!</strong> Mantenha os animais hidratados e evite passeios nos horários mais quentes.</div>
+                        <?php else: ?>
+                            <p class="muted-white small mt-3 mb-0">Consulte sempre as condições locais antes de atividades externas.</p>
+                        <?php endif; ?>
+                    <?php else: ?><p class="muted-white mt-4 mb-0">Informações climáticas indisponíveis no momento.</p><?php endif; ?>
+                </section>
+            </div>
+        </div>
+
+    <?php elseif ($action === 'tutores'): ?>
+        <section class="panel">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+                <div><h3 class="panel-title">Todos os tutores</h3><div class="panel-subtitle"><?= count($tutores) ?> cadastro(s) encontrado(s)</div></div>
+                <a href="?acao=novo_tutor" class="btn btn-primary"><i class="bi bi-plus-lg me-1"></i>Novo tutor</a>
+            </div>
+            <div class="table-responsive"><table class="table">
+                <thead><tr><th>ID</th><th>Nome</th><th>CPF</th><th>Telefone</th><th>Cidade / UF</th></tr></thead>
+                <tbody>
+                <?php if (!$tutores): ?><tr><td colspan="5" class="text-center text-secondary py-4">Nenhum tutor cadastrado.</td></tr><?php endif; ?>
+                <?php foreach ($tutores as $t): ?><tr><td>#<?= (int)$t['id'] ?></td><td class="fw-semibold"><?= e($t['nome_completo']) ?></td><td><?= e($t['cpf']) ?></td><td><?= e($t['telefone']) ?></td><td><?= e($t['cidade']) ?><?= $t['estado'] ? ' / '.e($t['estado']) : '' ?></td></tr><?php endforeach; ?>
+                </tbody>
+            </table></div>
+        </section>
+
+    <?php elseif ($action === 'novo_tutor'): ?>
+        <section class="panel">
+            <h3 class="panel-title mb-1">Dados do tutor</h3><p class="panel-subtitle mb-4">Preencha as informações para cadastrar um novo tutor.</p>
+            <form method="post">
+                <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                <div class="row g-3">
+                    <div class="col-md-8"><label class="form-label">Nome completo *</label><input name="nome_completo" class="form-control" required></div>
+                    <div class="col-md-4"><label class="form-label">CPF *</label><input name="cpf" class="form-control" placeholder="000.000.000-00" required></div>
+                    <div class="col-md-6"><label class="form-label">Telefone *</label><input name="telefone" class="form-control" placeholder="(00) 00000-0000" required></div>
+                    <div class="col-md-6"><label class="form-label">E-mail</label><input type="email" name="email" class="form-control"></div>
+                    <div class="col-md-3"><label class="form-label">CEP</label><input id="cep" name="cep" class="form-control" placeholder="00000-000" maxlength="9"></div>
+                    <div class="col-md-6"><label class="form-label">Endereço</label><input id="endereco" name="endereco" class="form-control"></div>
+                    <div class="col-md-3"><label class="form-label">Bairro</label><input id="bairro" name="bairro" class="form-control"></div>
+                    <div class="col-md-5"><label class="form-label">Cidade</label><input id="cidade" name="cidade" class="form-control"></div>
+                    <div class="col-md-2"><label class="form-label">Estado</label><input id="estado" name="estado" class="form-control" maxlength="2"></div>
+                </div>
+                <div id="cepFeedback" class="small text-secondary mt-2"></div>
+                <div class="d-flex gap-2 mt-4"><button name="cadastrar_tutor" class="btn btn-primary"><i class="bi bi-check-lg me-1"></i>Salvar tutor</button><a href="?acao=tutores" class="btn btn-light">Cancelar</a></div>
+            </form>
+        </section>
+
+    <?php elseif ($action === 'animais'): ?>
+        <section class="panel">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+                <div><h3 class="panel-title">Animais cadastrados</h3><div class="panel-subtitle"><?= count($animais) ?> registro(s)</div></div>
+                <a href="?acao=novo_animal" class="btn btn-primary"><i class="bi bi-plus-lg me-1"></i>Novo animal</a>
+            </div>
+            <div class="table-responsive"><table class="table">
+                <thead><tr><th>Nome</th><th>Espécie</th><th>Raça</th><th>Sexo</th><th>Peso</th><th>Tutor</th></tr></thead>
+                <tbody>
+                <?php if (!$animais): ?><tr><td colspan="6" class="text-center text-secondary py-4">Nenhum animal cadastrado.</td></tr><?php endif; ?>
+                <?php foreach ($animais as $a): ?><tr><td class="fw-semibold"><?= e($a['nome']) ?></td><td><?= e($a['especie']) ?></td><td><?= e($a['raca']) ?></td><td><?= e($a['sexo']) ?></td><td><?= $a['peso'] !== null ? e($a['peso']).' kg' : '—' ?></td><td><?= e($a['tutor_nome']) ?></td></tr><?php endforeach; ?>
+                </tbody>
+            </table></div>
+        </section>
+
+    <?php elseif ($action === 'novo_animal'): ?>
+        <section class="panel">
+            <h3 class="panel-title mb-1">Dados do animal</h3><p class="panel-subtitle mb-4">Cadastre o animal e vincule-o ao seu tutor.</p>
+            <?php if (!$tutores): ?><div class="alert alert-warning">Cadastre um tutor antes de cadastrar um animal. <a href="?acao=novo_tutor">Cadastrar tutor</a>.</div><?php else: ?>
+            <form method="post">
+                <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                <div class="row g-3">
+                    <div class="col-md-6"><label class="form-label">Nome do animal *</label><input name="nome" class="form-control" required></div>
+                    <div class="col-md-6"><label class="form-label">Tutor responsável *</label><select name="tutor_id" class="form-select" required><option value="">Selecione um tutor</option><?php foreach ($tutores as $t): ?><option value="<?= (int)$t['id'] ?>"><?= e($t['nome_completo']) ?></option><?php endforeach; ?></select></div>
+                    <div class="col-md-4"><label class="form-label">Espécie *</label><select name="especie" class="form-select" required><option value="">Selecione</option><option>Cachorro</option><option>Gato</option><option>Coelho</option><option>Ave</option><option>Outro</option></select></div>
+                    <div class="col-md-4"><label class="form-label">Raça</label><input name="raca" class="form-control"></div>
+                    <div class="col-md-4"><label class="form-label">Sexo</label><select name="sexo" class="form-select"><option value="">Selecione</option><option>Macho</option><option>Fêmea</option></select></div>
+                    <div class="col-md-4"><label class="form-label">Data de nascimento</label><input type="date" name="data_nascimento" class="form-control"></div>
+                    <div class="col-md-4"><label class="form-label">Cor</label><input name="cor" class="form-control"></div>
+                    <div class="col-md-4"><label class="form-label">Peso (kg)</label><input type="number" step="0.01" min="0" name="peso" class="form-control"></div>
+                    <div class="col-md-6"><label class="form-label">Microchip</label><input name="microchip" class="form-control"></div>
+                    <div class="col-12"><label class="form-label">Observações</label><textarea name="observacoes" rows="3" class="form-control"></textarea></div>
+                </div>
+                <div class="d-flex gap-2 mt-4"><button name="cadastrar_animal" class="btn btn-primary"><i class="bi bi-check-lg me-1"></i>Salvar animal</button><a href="?acao=animais" class="btn btn-light">Cancelar</a></div>
+            </form><?php endif; ?>
+        </section>
+
+    <?php elseif ($action === 'estoque'): ?>
+        <section class="panel">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-3 mb-3">
+                <div><h3 class="panel-title">Controle de estoque</h3><div class="panel-subtitle"><?= count($produtos) ?> produto(s) cadastrado(s)</div></div>
+                <a href="?acao=novo_estoque" class="btn btn-primary"><i class="bi bi-plus-lg me-1"></i>Adicionar produto</a>
+            </div>
+            <div class="table-responsive"><table class="table">
+                <thead><tr><th>Produto</th><th>Categoria</th><th>Quantidade</th><th>Validade</th><th>Fornecedor</th><th>Status</th></tr></thead>
+                <tbody>
+                <?php if (!$produtos): ?><tr><td colspan="6" class="text-center text-secondary py-4">Nenhum produto cadastrado.</td></tr><?php endif; ?>
+                <?php foreach ($produtos as $p): ?><tr><td class="fw-semibold"><?= e($p['produto']) ?></td><td><?= e($p['categoria']) ?></td><td><?= (int)$p['quantidade'] ?></td><td><?= $p['data_validade'] ? e(date('d/m/Y',strtotime($p['data_validade']))) : '—' ?></td><td><?= e($p['fornecedor']) ?></td><td><?php if ((int)$p['quantidade'] <= 5): ?><span class="badge text-bg-warning">Estoque baixo</span><?php else: ?><span class="badge text-bg-success">Disponível</span><?php endif; ?></td></tr><?php endforeach; ?>
+                </tbody>
+            </table></div>
+        </section>
+
+    <?php elseif ($action === 'novo_estoque'): ?>
+        <section class="panel">
+            <h3 class="panel-title mb-1">Adicionar produto</h3><p class="panel-subtitle mb-4">Informe os dados do produto para controlar o estoque.</p>
+            <form method="post">
+                <input type="hidden" name="csrf" value="<?= e(csrf_token()) ?>">
+                <div class="row g-3">
+                    <div class="col-md-6"><label class="form-label">Nome do produto *</label><input name="produto" class="form-control" required></div>
+                    <div class="col-md-6"><label class="form-label">Categoria</label><input name="categoria" class="form-control" placeholder="Medicamentos, vacinas, materiais..."></div>
+                    <div class="col-md-4"><label class="form-label">Quantidade *</label><input type="number" min="0" name="quantidade" class="form-control" required value="0"></div>
+                    <div class="col-md-4"><label class="form-label">Data de validade</label><input type="date" name="data_validade" class="form-control"></div>
+                    <div class="col-md-4"><label class="form-label">Fornecedor</label><input name="fornecedor" class="form-control"></div>
+                </div>
+                <div class="d-flex gap-2 mt-4"><button name="cadastrar_estoque" class="btn btn-primary"><i class="bi bi-check-lg me-1"></i>Salvar produto</button><a href="?acao=estoque" class="btn btn-light">Cancelar</a></div>
+            </form>
+        </section>
+
+    <?php else: ?>
+        <section class="panel"><h3 class="panel-title">Página não encontrada</h3><p class="panel-subtitle">A página solicitada não existe.</p><a href="?acao=dashboard" class="btn btn-primary">Voltar ao início</a></section>
+    <?php endif; ?>
+
+    <footer class="text-center text-secondary small mt-4">PetVida • Sistema de Gestão Veterinária • <?= date('Y') ?></footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const cepInput = document.getElementById('cep');
+if (cepInput) {
+    cepInput.addEventListener('blur', async () => {
+        const cep = cepInput.value.replace(/\D/g, '');
+        const feedback = document.getElementById('cepFeedback');
+        if (!cep) return;
+        if (cep.length !== 8) {
+            feedback.textContent = 'Digite um CEP com 8 números.';
+            return;
+        }
+        feedback.textContent = 'Consultando CEP...';
+        try {
+            const response = await fetch('?ajax_cep=' + encodeURIComponent(cep));
+            const data = await response.json();
+            if (!response.ok || data.erro) throw new Error(data.mensagem || 'CEP não encontrado.');
+            document.getElementById('endereco').value = data.logradouro || '';
+            document.getElementById('bairro').value = data.bairro || '';
+            document.getElementById('cidade').value = data.localidade || '';
+            document.getElementById('estado').value = data.uf || '';
+            feedback.textContent = 'Endereço preenchido. Confira os dados antes de salvar.';
+        } catch (error) {
+            feedback.textContent = error.message || 'Não foi possível consultar o CEP.';
+        }
+    });
+}
+</script>
+</body>
+</html>
